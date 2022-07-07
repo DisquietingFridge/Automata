@@ -7,52 +7,23 @@
 #include "Misc/Char.h"
 #include "Async/Async.h"
 #include "Async/AsyncWork.h"
-#include "Containers/ArrayView.h"
 
-
-const uint8 NumCustomData = 9;
-
-UAutomataCell::UAutomataCell()
-{
-
-}
-
-void UAutomataCell::ApplyCellRules()
-{
-	int AliveNeighbors = GetCellAliveNeighbors();
-
-	if (CurrentState)
-	{ // Any live cell with appropriate amount of neighbors survives
-		NextState = SurviveRules.Contains(AliveNeighbors);
-	}
-	else
-	{ // Any dead cell with appropriate amount of neighbors becomes alive
-		NextState = BirthRules.Contains(AliveNeighbors);
-	}
-}
-
-int UAutomataCell::GetCellAliveNeighbors()
-{
-	 //Query the cell's neighborhood to sum its alive neighbors
-	uint8 AliveNeighbors = 0;
-	for (UAutomataCell* Neighbor : Neighborhood)
-	{
-		AliveNeighbors = AliveNeighbors + Neighbor->CurrentState;
-	}
-	return AliveNeighbors;
-}
 
 // Sets default values
 AAutomataDriver::AAutomataDriver()
 {
 	PrimaryActorTick.bCanEverTick = false;
 	RootComponent = CreateOptionalDefaultSubobject<USceneComponent>(TEXT("Root Component"));
-	
 }
 
 void AAutomataDriver::PreInitializeComponents()
 {
 	Super::PreInitializeComponents();
+
+	NumClusters = XClusters * ZClusters;
+	CellsPerCluster = XCellsPerCluster * ZCellsPerCluster;
+	NumCells = NumClusters * CellsPerCluster;
+	NumCustomData = CellsPerCluster;
 
 	// Create material and set up properties
 	InitializeMaterial();
@@ -64,14 +35,9 @@ void AAutomataDriver::PreInitializeComponents()
 
 void AAutomataDriver::PostInitializeComponents()
 {
-
-
 	Super::PostInitializeComponents();
 
-	InitializeCellArray();
-
 	InitializeCellRules();
-
 
 	InitializeCellStates();
 
@@ -81,20 +47,42 @@ void AAutomataDriver::PostInitializeComponents()
 
 	InitializeCellNeighborhoods();
 
+	InitializeCellNeighborsOf();
 
 	InitializeCellProcessors();
 
-	RunProcessesOnce();
+	StartingDataSetup();
 }
 
+
+void AAutomataDriver::StartingDataSetup()
+{
+	NextStepTime = 0;
+
+	RunProcessesOnce();
+
+}
+
+void AAutomataDriver::RunProcessesOnce()
+{
+
+	// start the processes (to calculate Next Step for all the cells)
+	CurrentProcess = 0;
+	Processors[CurrentProcess]->StartSynchronousTask();
+	// having kicked off the first process, they should all cascade to completion, until the final one is complete
+	// wait until the last process in this cascade is complete
+	Processors.Last()->EnsureCompletion(false);
+}
 
 // Called when the game starts or when spawned
 void AAutomataDriver::BeginPlay()
 {
 	Super::BeginPlay();
+
+	StepComplete();
 		
 	// we are ready to start the iteration steps.
-	GetWorldTimerManager().SetTimer(StepTimer, this, &AAutomataDriver::TimerFired, StepPeriod/(Divisions + 1), true);
+	GetWorldTimerManager().SetTimer(StepTimer, this, &AAutomataDriver::TimerFired, StepPeriod, true);
 }
 
 void AAutomataDriver::InitializeMaterial()
@@ -103,6 +91,8 @@ void AAutomataDriver::InitializeMaterial()
 	// Create material and set up properties
 	DynMaterial = UMaterialInstanceDynamic::Create(Mat, this);
 
+	DynMaterial->SetScalarParameterValue("XCellsPerCluster", XCellsPerCluster);
+	DynMaterial->SetScalarParameterValue("ZCellsPerCluster", ZCellsPerCluster);
 	DynMaterial->SetScalarParameterValue("PhaseExponent", PhaseExponent);
 	DynMaterial->SetScalarParameterValue("EmissiveMultiplier", EmissiveMultiplier);
 	DynMaterial->SetVectorParameterValue("OnColor", OnColor);
@@ -113,7 +103,7 @@ void AAutomataDriver::InitializeMaterial()
 void AAutomataDriver::InitializeInstances()
 {
 	ClusterInstances.Reserve(Divisions);
-	for (uint32 i = 0; i < Divisions; ++i)
+	for (int i = 0; i < Divisions; ++i)
 	{
 		UInstancedStaticMeshComponent* NewClusterInstance = NewObject<UInstancedStaticMeshComponent>(this);
 		NewClusterInstance->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
@@ -138,17 +128,16 @@ void AAutomataDriver::InitializeInstances()
 
 void AAutomataDriver::InitializeTransforms()
 {
-	uint32 NumClusters = GetNumClusters();
 
 	TArray<FTransform> Transforms;
 	Transforms.Init(FTransform(), NumClusters);
 
 	// calculate transforms for each cluster
-	ParallelFor(NumClusters, [&](int32 ClusterID)
+	ParallelFor(NumClusters, [&](int ClusterID)
 	{
 		// derive grid coordinates from cluster index
-		int32 ClusterX = ClusterID % XDim;
-		int32 ClusterZ = ClusterID / XDim;
+		int ClusterX = ClusterID % XClusters;
+		int ClusterZ = ClusterID / XClusters;
 
 		//Instance's transform is based on its grid coordinate
 		Transforms[ClusterID] = FTransform((FVector(ClusterX, 0, ClusterZ) * Offset));
@@ -158,7 +147,7 @@ void AAutomataDriver::InitializeTransforms()
 	int MaxClustersPerInstance = int(ceilf(float(NumClusters) / float(Divisions)));
 
 	// Add instances to each ClusterInstance component, applying appropriate transform
-	for (uint32 ClusterID = 0; ClusterID < NumClusters; ++ClusterID)
+	for (int ClusterID = 0; ClusterID < NumClusters; ++ClusterID)
 	{
 		int InstanceIndex = ClusterID / MaxClustersPerInstance;
 		ClusterInstances[InstanceIndex]->AddInstance(Transforms[ClusterID]);
@@ -166,57 +155,18 @@ void AAutomataDriver::InitializeTransforms()
 
 }
 
-void AAutomataDriver::RunProcessesOnce()
-{
-	NextStepTime = GetWorld()->GetTimeSeconds() + StepPeriod;
-
-	// start the processes (to calculate Next Step for all the cells)
-	CurrentProcess = 0;
-	Processors[CurrentProcess]->StartSynchronousTask();
-	// having kicked off the first process, they should all cascade to completion, until the final one is complete
-	// wait until the last process in this cascade is complete
-	Processors.Last()->EnsureCompletion(false);
-}
-
-
-TArray<uint32> AAutomataDriver::CellsIDsFromCluster(uint32 ClusterID)
-{
-	// Derive grid coordinates from cluster index
-	int32 ClusterX = ClusterID % XDim;
-	int32 ClusterZ = ClusterID / XDim;
-
-	//Define CellIDs contained within this cluster
-	TArray<uint32> CellIDs
-	{
-		(2 * ClusterZ * 2 * XDim) + (2 * ClusterX), // bottom left cell ID
-		(2 * ClusterZ * 2 * XDim) + (2 * ClusterX + 1), // bottom right cell ID
-		((2 * ClusterZ + 1) * 2 * XDim) + (2 * ClusterX), // upper left cell ID
-		((2 * ClusterZ + 1) * 2 * XDim) + (2 * ClusterX + 1), // upper right cell ID
-	};
-
-	return CellIDs;
-}
-
-
-void AAutomataDriver::InitializeCellArray()
-{
-	CellArray.Reserve(GetNumCells());
-	
-	for (uint32 i = 0; i < GetNumCells(); ++i)
-	{
-		UAutomataCell* NewCell = NewObject<UAutomataCell>(this);
-		CellArray.Add(NewCell);
-		CellArray[i]->ID = i;
-	}
-}
-
 void AAutomataDriver::InitializeCellRules()
 {
+	BirthRules.Init(false, 10);
+	SurviveRules.Init(false, 10);
+
 	for (TCHAR character : BirthString)
 	{
 		if (TChar<TCHAR>::IsDigit(character))
 		{
-			BirthRules.Add(TChar<TCHAR>::ConvertCharDigitToInt(character));
+			//BirthRules.Add(TChar<TCHAR>::ConvertCharDigitToInt(character));
+			int32 index = TChar<TCHAR>::ConvertCharDigitToInt(character);
+			BirthRules[index] = true;
 		}
 	}
 
@@ -224,32 +174,40 @@ void AAutomataDriver::InitializeCellRules()
 	{
 		if (TChar<TCHAR>::IsDigit(character))
 		{
-			SurviveRules.Add(TChar<TCHAR>::ConvertCharDigitToInt(character));
+			//SurviveRules.Add(TChar<TCHAR>::ConvertCharDigitToInt(character));
+			int32 index = TChar<TCHAR>::ConvertCharDigitToInt(character);
+			SurviveRules[index] = true;
 		}
 	}
 
-	for (UAutomataCell* Cell : CellArray)
-	{
-		Cell->BirthRules = this->BirthRules;
-		Cell->SurviveRules = this->SurviveRules;
-	}
 }
 
 void AAutomataDriver::InitializeCellStates()
 {
-	for (UAutomataCell* Cell : CellArray)
+	CurrentStates.Reserve(NumCells);
+
+	for (int i = 0; i < NumCells; ++i)
 	{
-		Cell->CurrentState = (float(rand()) < (float(RAND_MAX) * Probability));
-		Cell->NextState = 0;
+		CurrentStates.Add(FMath::FRandRange(0, TNumericLimits<int32>::Max() - 1) < Probability * TNumericLimits<int32>::Max());
 	}
+
+	NextStates.Init(false, NumCells);
+
+	ChangedLastStep.Init(true, NumCells);
+	ChangedThisStep.Init(true, NumCells);
 }
 
 void AAutomataDriver::InitializeCellCustomData()
 {
-	int MaxClustersPerInstance = int(ceilf(float(GetNumClusters()) / float(Divisions)));
+
+	CurrentDataSlots.Init(nullptr, NumCells);
+	NextDataSlots.Init(nullptr, NumCells);
+	SwitchTimeSlots.Init(nullptr, NumCells);
+
+	int MaxClustersPerInstance = int(ceilf(float(NumClusters) / float(Divisions)));
 
 
-	ParallelFor(GetNumClusters(), [&](int32 ClusterID)
+	ParallelFor(NumClusters, [&](int32 ClusterID)
 	{
 		// Determine which instance collection cluster belongs to
 		int InstanceIndex = ClusterID / MaxClustersPerInstance;
@@ -257,66 +215,36 @@ void AAutomataDriver::InitializeCellCustomData()
 		// define cluster ID local to the cluster's instance collection
 		int InstanceClusterID = ClusterID - InstanceIndex * MaxClustersPerInstance;
 
-		int ClusterTimeIndex = InstanceClusterID * 9 + 8;
 
-		TArray<uint32> CellIDs = CellsIDsFromCluster(ClusterID);
+		TArray<int> CellIDs = CellsIDsFromCluster(ClusterID);
 
 		// for each cell within the cluster
-		for (uint8 Quadrant = 0; Quadrant < 4; ++Quadrant)
+		for (int Quadrant = 0; Quadrant < CellIDs.Num(); ++Quadrant)
 		{
 
-			UAutomataCell* Cell = CellArray[CellIDs[Quadrant]];
+			int CurrentDataIndex = NumCustomData * InstanceClusterID + Quadrant;
 
-			uint32 CurrentDataIndex = NumCustomData * InstanceClusterID + (2 * Quadrant);
-			uint32 NextDataIndex = CurrentDataIndex + 1;
+			int CellID = CellIDs[Quadrant];
 
-			Cell->NextDataSlot = &(ClusterInstances[InstanceIndex]->PerInstanceSMCustomData[NextDataIndex]);
-			Cell->CurrentDataSlot = &(ClusterInstances[InstanceIndex]->PerInstanceSMCustomData[CurrentDataIndex]);
-			Cell->SwitchTimeSlot = &(ClusterInstances[InstanceIndex]->PerInstanceSMCustomData[ClusterTimeIndex]);
+			CurrentDataSlots[CellID] = &(ClusterInstances[InstanceIndex]->PerInstanceSMCustomData[CurrentDataIndex]);
 
-			*(Cell->CurrentDataSlot) = -2 * (StepPeriod * StepsToFade);
-
-			// Set "Current" data index to show early switchoff time.
-			//ClusterInstances[InstanceIndex]->PerInstanceSMCustomData[NextDataIndex - 1] = -2 * (StepPeriod * StepsToFade);
-
-			SetCellNextCustomData(Cell);
-
+			*(CurrentDataSlots[CellID]) = -2 * (StepPeriod * StepsToFade);
 		}
-
 	});
-
-}
-
-void AAutomataDriver::SetCellNextCustomData(UAutomataCell* Cell)
-{
-
-	// register change based on state
-	if (Cell->NextState)
-	{  // switch-off time is in the future, i.e. cell is still on
-		*(Cell->NextDataSlot) = NextStepTime + 3 * StepPeriod;
-	}
-	else // is off at next time
-	{
-		if (Cell->CurrentState)  // was previously on
-		{ // register switch-off time as being upcoming step
-			*(Cell->NextDataSlot) = NextStepTime;
-		}
-		else // preserve old switch-off time
-		{
-			*(Cell->NextDataSlot) = *(Cell->CurrentDataSlot);
-		}
-	}
-
 }
 
 void AAutomataDriver::InitializeCellNeighborhoods()
 {
+	Neighborhoods.Init(nullptr, NumCells);
 
-	ParallelFor(GetNumCells(), [&](int32 CellID)
+	NeighborhoodChangedLastStep.Init(true, NumCells);
+	NeighborhoodChangedThisStep.Init(false, NumCells);
+
+	ParallelFor(NumCells, [&](int CellID)
 	{
 		// cell dimensions are twice as large as cluster dimensions
-		int XCells = XDim * 2;
-		int ZCells = ZDim * 2;
+		int XCells = XClusters * XCellsPerCluster;
+		int ZCells = ZClusters * ZCellsPerCluster;
 
 		// derive grid coordinates from index
 		int32 z = CellID / XCells;
@@ -337,92 +265,209 @@ void AAutomataDriver::InitializeCellNeighborhoods()
 
 		//uint32 NeighborhoodStart = 8 * CellID;
 
-		TArray<UAutomataCell*> Neighborhood
+		TArray<int> Neighborhood
 		{
 			//assign lower neighborhood row IDs
-			CellArray[xDown + (XCells * zDown)],
-			CellArray[x + (XCells * zDown)],
-			CellArray[xUp + (XCells * zDown)],
+			xDown + (XCells * zDown),
+			x + (XCells * zDown),
+			xUp + (XCells * zDown),
 
 			//assign middle neighborhood row IDs
-			CellArray[xDown + (XCells * z)],
-			CellArray[xUp + (XCells * z)],
+			xDown + (XCells * z),
+			xUp + (XCells * z),
 
 			// assign upper neighborhood row IDs
-			CellArray[xDown + (XCells * zUp)],
-			CellArray[x + (XCells * zUp)],
-			CellArray[xUp + (XCells * zUp)]
+			xDown + (XCells * zUp),
+			x + (XCells * zUp),
+			xUp + (XCells * zUp)
 		};
 
-		CellArray[CellID]->Neighborhood = Neighborhood;
+		TSharedPtr<TArray<int>> NeighborhoodPtr = MakeShared<TArray<int>>(Neighborhood);
+
+		Neighborhoods[CellID] = NeighborhoodPtr;
+
 	});
+}
+
+void AAutomataDriver::InitializeCellNeighborsOf()
+{
+	NeighborsOf = Neighborhoods;
 }
 
 void AAutomataDriver::InitializeCellProcessors()
 {
-	int MaxClustersPerInstance = int(ceilf(float(GetNumClusters()) / float(Divisions)));
+	int MaxClustersPerInstance = int(ceilf(float(NumClusters) / float(Divisions)));
 
 	Processors.Reserve(Divisions);
-	for (uint32 i = 0; i < Divisions; ++i)
+	for (int i = 0; i < Divisions; ++i)
 	{
-		TArray<UAutomataCell*> Cells;
-		Cells.Reserve(MaxClustersPerInstance * 4);
+		TArray<int> ProcessorCells;
+		ProcessorCells.Reserve(MaxClustersPerInstance * CellsPerCluster);
 
-		uint32 FirstCluster = i * MaxClustersPerInstance;
-		uint32 End = std::min((i + 1) * MaxClustersPerInstance, GetNumClusters());
+		int FirstCluster = i * MaxClustersPerInstance;
+		int End = std::min(FirstCluster + MaxClustersPerInstance, NumClusters);
 
-		for (uint32 j = FirstCluster; j < End; ++j)
+		for (int j = FirstCluster; j < End; ++j)
 		{
-			TArray<uint32> CellIDs = CellsIDsFromCluster(j);
-			for (uint32 ID : CellIDs)
-			{
-				Cells.Add(CellArray[ID]);
-			}
-		}	
+			ProcessorCells.Append(CellsIDsFromCluster(j));
+		}
 
-		FAsyncTask<CellProcessor>* NewProcessor = new FAsyncTask<CellProcessor>(this, Cells);
+		FAsyncTask<CellProcessor>* NewProcessor = new FAsyncTask<CellProcessor>(this, ProcessorCells);
 		Processors.Add(NewProcessor);
-		
+
 	}
 }
 
-void AAutomataDriver::CellProcessorWork(const TArray<UAutomataCell*>& Cells)
+TArray<int> AAutomataDriver::CellsIDsFromCluster(const int ClusterID) const
+{
+	// Derive grid coordinates from cluster index
+	int ClusterX = ClusterID % (int)XClusters;
+	int ClusterZ = ClusterID / (int)XClusters;
+
+	TArray<int> CellIDs;
+	CellIDs.Reserve(CellsPerCluster);
+
+	for (int z = 0; z < ZCellsPerCluster; ++z)
+	{
+		for (int x = 0; x < XCellsPerCluster; ++x)
+		{
+			CellIDs.Add((ClusterZ * ZCellsPerCluster + z) * (int)XClusters * XCellsPerCluster + XCellsPerCluster * ClusterX + x);
+		}
+	}
+
+	return CellIDs;
+}
+
+void AAutomataDriver::SetCellNextCustomData(const int CellID)
 {
 
-	ParallelFor(Cells.Num(), [&](int32 i)
+	// register change based on state
+	if (NextStates[CellID])
+	{  // switch-off time is in the future, i.e. cell is still on
+		*(CurrentDataSlots[CellID]) = TNumericLimits<float>::Max();
+	}
+	else // is off at next time
 	{
-		UAutomataCell* Cell = Cells[i];
-		*(Cell->SwitchTimeSlot) = NextStepTime;
-
-		Cell->ApplyCellRules();
-
-		//shift material state in time, so "Next" state is assigned to "Current"
-		*(Cell->CurrentDataSlot) = *(Cell->NextDataSlot);
-
-		// register change based on state
-		SetCellNextCustomData(Cell);
-	},EParallelForFlags::BackgroundPriority);
+		if (CurrentStates[CellID])  // was previously on
+		{ // register switch-off time as being upcoming step
+			*(CurrentDataSlots[CellID]) = NextStepTime;
+		}
+	}
 
 }
 
-void AAutomataDriver::TimerFired()
+void AAutomataDriver::SetCellNextCustomData(const TArray<int>& CellIDs)
 {
-	// if there are still materials to update
-	if (MaterialToUpdate < Divisions)
+	ParallelFor(CellIDs.Num(), [&](int32 i)
 	{
-		UpdateInstance(MaterialToUpdate);
-		MaterialToUpdate++;	
+		int CellID = CellIDs[i];
+
+		if (NeighborhoodChangedLastStep[CellID] || ChangedLastStep[CellID])// register change based on state
+		{
+			//SetCellNextCustomData(CellID);
+			// register change based on state
+			if (NextStates[CellID])
+			{  // switch-off time is in the future, i.e. cell is still on
+				*(CurrentDataSlots[CellID]) = TNumericLimits<float>::Max();
+			}
+			else // is off at next time
+			{
+				if (CurrentStates[CellID])  // was previously on
+				{ // register switch-off time as being upcoming step
+					*(CurrentDataSlots[CellID]) = NextStepTime;
+				}
+			}
+		}
+
+
+	}/*, EParallelForFlags::BackgroundPriority*/);
+}
+
+
+
+void AAutomataDriver::ApplyCellRules(int CellID)
+{
+	int AliveNeighbors = GetCellAliveNeighbors(CellID);
+
+	if (CurrentStates[CellID])
+	{ // Any live cell with appropriate amount of neighbors survives
+		NextStates[CellID] = SurviveRules[AliveNeighbors];
 	}
 	else
-	{
-		MaterialToUpdate = 0;
-		// no more materials to update- automata step is complete
-		StepComplete();
+	{ // Any dead cell with appropriate amount of neighbors becomes alive
+		NextStates[CellID] = BirthRules[AliveNeighbors];
 	}
+
+	//there has been a change of state
+	if (NextStates[CellID] != CurrentStates[CellID])
+	{
+		ChangedThisStep[CellID] = true;
+		for (int InfluencedCellID : *(NeighborsOf[CellID]))
+		{
+			NeighborhoodChangedThisStep[InfluencedCellID] = true;
+		}
+	}
+
+}
+
+void AAutomataDriver::ApplyCellRules(const TArray<int>& CellIDs)
+{
+	ParallelFor(CellIDs.Num(), [&](int32 i)
+	{
+		const int CellID = CellIDs[i];
+
+		if (NeighborhoodChangedLastStep[CellID] || ChangedLastStep[CellID])
+		{
+			int AliveNeighbors = GetCellAliveNeighbors(CellID);
+
+			if (CurrentStates[CellID])
+			{ // Any live cell with appropriate amount of neighbors survives
+				NextStates[CellID] = SurviveRules[AliveNeighbors];
+			}
+			else
+			{ // Any dead cell with appropriate amount of neighbors becomes alive
+				NextStates[CellID] = BirthRules[AliveNeighbors];
+			}
+
+			//there has been a change of state
+			if (NextStates[CellID] != CurrentStates[CellID])
+			{
+				ChangedThisStep[CellID] = true;
+				for (int InfluencedCellID : *(NeighborsOf[CellID]))
+				{
+					NeighborhoodChangedThisStep[InfluencedCellID] = true;
+				}
+			}
+
+		}
+
+	});
+}
+
+
+
+int AAutomataDriver::GetCellAliveNeighbors(const int CellID)
+{
+	//Query the cell's neighborhood to sum its alive neighbors
+	int AliveNeighbors = 0;
+	TArray<int> Neighborhood = *(Neighborhoods[CellID]);
+	for (int NeighborID : Neighborhood)
+	{
+		AliveNeighbors = AliveNeighbors + CurrentStates[NeighborID];
+	}
+	return AliveNeighbors;
+}
+
+void AAutomataDriver::CellProcessorWork(const TArray<int>& CellIDs)
+{
+	ApplyCellRules(CellIDs);
+
+	SetCellNextCustomData(CellIDs);
+
 }
 
 void AAutomataDriver::StepComplete()
- {
+{
 
 	// have all the cells' next state calculated before sending to material
 	// strictly speaking we only need to check the last one, but
@@ -431,16 +476,15 @@ void AAutomataDriver::StepComplete()
 	{
 		Process->EnsureCompletion(false);
 	}
-	
-	NextStepTime = GetWorld()->GetTimeSeconds() + StepPeriod;
 
-	// make new Current state the old Next state.
-
-	ParallelFor(CellArray.Num(), [&](int32 i) 
+	for (int i = 0; i < ClusterInstances.Num(); ++i)
 	{
-		CellArray[i]->CurrentState = CellArray[i]->NextState;
-	}, EParallelForFlags::BackgroundPriority);
+		UpdateInstance(i);
+	}
 	
+
+	TimestepPropertyShift();
+
 	// kick off calculation of next stage
 	CurrentProcess = 0;
 	MaterialToUpdate = 0;
@@ -448,17 +492,23 @@ void AAutomataDriver::StepComplete()
 
 }
 
-void AAutomataDriver::UpdateInstance(uint32 Index)
+void AAutomataDriver::TimestepPropertyShift()
 {
-	// Safety check
-	//Processors[Index]->EnsureCompletion();
+	NextStepTime = GetWorld()->GetTimeSeconds() + StepPeriod;
 
-	// Apply changes to instance
-	
-	ClusterInstances[Index]->MarkRenderStateDirty();
-	ClusterInstances[Index]->InstanceUpdateCmdBuffer.NumEdits++;
-	
+	ParallelFor(NumCells, [&](int32 CellID)
+	{
+		CurrentStates[CellID] = NextStates[CellID];
 
+		//*(CurrentDataSlots[CellID]) = *(NextDataSlots[CellID]);
+
+		NeighborhoodChangedLastStep[CellID] = NeighborhoodChangedThisStep[CellID];
+		NeighborhoodChangedThisStep[CellID] = false;
+
+		ChangedLastStep[CellID] = ChangedThisStep[CellID];
+		ChangedThisStep[CellID] = false;
+
+	}/*, EParallelForFlags::BackgroundPriority*/);
 }
 
 void AAutomataDriver::ProcessCompleted()
@@ -474,22 +524,37 @@ void AAutomataDriver::ProcessCompleted()
 	}
 }
 
-
-
-CellProcessor::CellProcessor(AAutomataDriver* Driver, TArray<UAutomataCell*> Cells)
+void AAutomataDriver::TimerFired()
 {
-	this->Driver = Driver;
-	this->Cells = Cells;
-	
+	StepComplete();
+}
+
+void AAutomataDriver::UpdateInstance(int Index)
+{
+	// Safety check
+	//Processors[Index]->EnsureCompletion();
+
+	// Apply changes to instance
+
+	ClusterInstances[Index]->MarkRenderStateDirty();
+	ClusterInstances[Index]->InstanceUpdateCmdBuffer.NumEdits++;
+
 }
 
 
+
+CellProcessor::CellProcessor(AAutomataDriver* Driver, TArray<int> CellIDs)
+{
+	this->Driver = Driver;
+	this->CellIDs = CellIDs;
+	
+}
 
 // Calculate state transitions for the cells this processor is responsible for
 	void CellProcessor::DoWork()
 	{
 		//Driver->ProcessorWork(ClusterInstance, StartingIndex);
-		Driver->CellProcessorWork(Cells);
+		Driver->CellProcessorWork(CellIDs);
 
 		// Signal to Automata Driver that this processing has been completed
 		Driver->ProcessCompleted();

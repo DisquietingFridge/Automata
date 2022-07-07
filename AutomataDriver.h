@@ -10,38 +10,6 @@
 #include "AutomataDriver.generated.h"
 
 
-UCLASS()
-class UAutomataCell :public UObject
-{
-	GENERATED_BODY()
-
-public:
-
-	UAutomataCell();
-
-	virtual void ApplyCellRules();
-
-	virtual int GetCellAliveNeighbors();
-
-	int ID = 0;
-
-	bool CurrentState = false;
-	bool NextState = true;
-
-	TArray<UAutomataCell*> Neighborhood;
-
-	TSet<int32> BirthRules;
-
-	TSet<int32> SurviveRules;
-
-	float* CurrentDataSlot = nullptr;
-	float* NextDataSlot = nullptr;
-	float* SwitchTimeSlot = nullptr;
-
-
-};
-
-
 // CellProcessor is used to asynchronously update the cell states that it is responsible for,
 // so that these calculations don't cause a performance bottleneck by being carried out all at once
 
@@ -58,7 +26,7 @@ class CellProcessor : public FNonAbandonableTask
 public:
 
 	// Initialization largely consists of getting pointers from the Driver
-	CellProcessor(AAutomataDriver* Driver, TArray<UAutomataCell*> Cells);
+	CellProcessor(AAutomataDriver* Driver, TArray<int> CellIDs);
 
 
 protected:
@@ -66,11 +34,8 @@ protected:
 	// AutomataDriver this processor is working for
 	class AAutomataDriver* Driver = nullptr;
 
-
-	// Cell ID that the first Instance element corresponds to
-	uint32 StartingIndex;
 	UPROPERTY()
-		TArray<UAutomataCell*> Cells;
+		TArray<int> CellIDs;
 
 
 public:
@@ -110,9 +75,7 @@ protected:
 
 	virtual void RunProcessesOnce();
 
-	virtual TArray<uint32> CellsIDsFromCluster(uint32 ClusterID);
-
-	virtual void InitializeCellArray();
+	virtual TArray<int> CellsIDsFromCluster(const int ClusterID) const;
 
 	virtual void InitializeCellRules();
 
@@ -120,14 +83,57 @@ protected:
 
 	virtual void InitializeCellCustomData();
 
-	virtual void SetCellNextCustomData(UAutomataCell* Cell);
-
 	virtual void InitializeCellNeighborhoods();
+
+	virtual void InitializeCellNeighborsOf();
 
 	virtual void InitializeCellProcessors();
 
+	virtual void StartingDataSetup();
+
+
+
+	virtual void SetCellNextCustomData(int CellID);
+	virtual void SetCellNextCustomData(const TArray<int>& CellIDs);
+
+	virtual void ApplyCellRules(int CellID);
+	virtual void ApplyCellRules(const TArray<int>& CellIDs);
+
+	virtual void TimestepPropertyShift();
+
+	virtual int GetCellAliveNeighbors(int CellID);
+
+	//Set that stores the birth rules for the automata
+	TArray<bool> BirthRules;
+	//Set that stores the survival rules for the automata
+	TArray<bool> SurviveRules;
+
+	TArray<bool> CurrentStates;
+	TArray<bool> NextStates;
+
+	TArray<bool> NeighborhoodChangedThisStep;
+	TArray<bool> NeighborhoodChangedLastStep;
+
+	TArray<bool> ChangedThisStep;
+	TArray<bool> ChangedLastStep;
+
+	TArray<float*> CurrentDataSlots;
+	TArray<float*>  NextDataSlots;
+	TArray<float*> SwitchTimeSlots;
+
+
+
+	TArray<TSharedPtr<TArray<int>>> Neighborhoods;
+	TArray<TSharedPtr<TArray<int>>> NeighborsOf;
+
+	
+
+	// Array of CellProcessor objects that are responsible for incrementing an associated instance collection
+	TArray<FAsyncTask<CellProcessor>*> Processors;
+
+	// Array that stores the instance collections
 	UPROPERTY()
-		TArray<UAutomataCell*> CellArray;
+		TArray<UInstancedStaticMeshComponent*> ClusterInstances;
 	
 
 	// Mesh that will be instanced to form the grid- typically a simple square
@@ -145,14 +151,17 @@ protected:
 	// Number of discrete mesh instance collections
 	// Each collection will have its materials updated at a different time, smoothing framerate in many scenarios
 	UPROPERTY(Blueprintable, EditAnywhere)
-		uint32 Divisions = 2;
+		int Divisions = 2;
 
-	// Array of CellProcessor objects that are responsible for incrementing an associated instance collection
-	TArray<FAsyncTask<CellProcessor>*> Processors;
+	UPROPERTY(Blueprintable, EditAnywhere)
+		int XCellsPerCluster = 2;
+	UPROPERTY(Blueprintable, EditAnywhere)
+		int ZCellsPerCluster = 2;
 
-	// Array that stores the instance collections
-	UPROPERTY()
-		TArray<UInstancedStaticMeshComponent*> ClusterInstances;
+	int NumClusters;
+	int CellsPerCluster;
+	int NumCells;
+	int NumCustomData;
 
 	// Probability when initializing that a cell will start off alive.
 	// Functionally ranges from 0 to 1.
@@ -169,27 +178,24 @@ protected:
 	UPROPERTY(Blueprintable, EditAnywhere)
 		FString SurviveString = TEXT("23");
 
-	//Set that stores the birth rules for the automata
-	TSet<int32> BirthRules;
-	//Set that stores the survival rules for the automata
-	TSet<int32> SurviveRules;
+
 
 
 
 	//Horizontal dimension of the grid of clusters
 	//Since each cluster is a square of 2x2 cells, the horizontal dimension of the grid of cells is 2-times this amount.
 	UPROPERTY(Blueprintable, EditAnywhere)
-		uint32 XDim = 300;
+		int XClusters = 300;
 
 	//Vertical dimension of the grid of clusters
 	//Since each cluster is a square of 2x2 cells, the horizontal dimension of the grid of cells is 2-times this amount.
 	UPROPERTY(Blueprintable, EditAnywhere)
-		uint32 ZDim = 300;
+		int ZClusters = 300;
 
 	// Spacing that determines how far adjacent clusters should be placed away from each other
 	// The square mesh used has a 200x200 unit area.
 	UPROPERTY(Blueprintable, EditAnywhere)
-		int32 Offset = 200;
+		int Offset = 1;
 
 	// time per automata step in seconds
 	UPROPERTY(Blueprintable, EditAnywhere) 
@@ -198,7 +204,7 @@ protected:
 	// Exponent that drives how quickly a switched-off cell fades into the off state
 	// An exponent of 1 will fade linearly over the transition period. A higher exponent will fade out quicker initially, and a lower exponent will fade out slower initially.
 	UPROPERTY(Blueprintable, EditAnywhere) 
-		float PhaseExponent = 1;
+		float PhaseExponent = 201;
 
 	// Simple float used to store the time of the next step transition
 	float NextStepTime = 0;
@@ -210,7 +216,6 @@ protected:
 	// "Off" state cell color
 	UPROPERTY(Blueprintable, EditAnywhere)
 		FLinearColor OffColor = FLinearColor(0.0, 0, 0.0, 1);
-
 
 	// Material property used to control emissive value
 	UPROPERTY(Blueprintable, EditAnywhere) 
@@ -230,16 +235,16 @@ protected:
 
 	// send updates to instance collection denoted by Index
 	UFUNCTION()
-		void UpdateInstance(uint32 Index);
+		void UpdateInstance(int Index);
 
 	// Called when StepTimer is fired
 	UFUNCTION()
 		void TimerFired();
 
 	// Keeps track of CellProcessor to be fired off
-	uint32 CurrentProcess = 0;
+	int CurrentProcess = 0;
 	// Keeps track of which material instance to update
-	uint32 MaterialToUpdate = 0;
+	int MaterialToUpdate = 0;
 
 
 public:	
@@ -247,21 +252,7 @@ public:
 	// called by a Processor when it has finished its asynchronous task
 	void ProcessCompleted();
 
-	virtual void CellProcessorWork(const TArray<UAutomataCell*>& Cells);
-
-
-
-	// These functions are simple getter functions, mostly to be called by CellProcessor objects
-
-	virtual uint32 GetNumClusters()
-	{
-		return XDim * ZDim;
-	}
-
-	virtual uint32 GetNumCells()
-	{
-		return 4 * GetNumClusters();
-	}
+	virtual void CellProcessorWork(const TArray<int>& CellIDs);
 
 };
 
